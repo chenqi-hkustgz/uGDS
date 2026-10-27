@@ -66,7 +66,11 @@
 #include <unistd.h>
 #include <vector>
 
-#if defined(__has_include) && __has_include(<cuda_runtime.h>)
+// The bounce copies use the CUDA runtime, so remote handles exist only in
+// builds with the CUDA backend (_CUDA); uGDSHandleRegisterNvmeof refuses
+// them otherwise. In a CUDA+HIP build, I/O checks that each buffer is CUDA
+// memory, since a HIP allocation cannot go through these copies.
+#ifdef _CUDA
 #include <cuda_runtime.h>
 #define UGDS_NVMEOF_CUDA 1
 #endif
@@ -150,7 +154,8 @@ struct Bounce {
 
 // Synchronous GPU<->host copy. stream == nullptr means cudaStreamPerThread
 // (caller threads); lanes pass their private non-blocking stream. Returns 0
-// or -EIO. Without CUDA headers (host-only test builds) it is a memcpy.
+// or -EIO. Without the CUDA backend no remote handle can be registered, so
+// that branch is never reached.
 int copy(void* dst, const void* src, size_t n, bool to_gpu, void* stream) {
 #ifdef UGDS_NVMEOF_CUDA
     auto kind = to_gpu ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost;
@@ -158,9 +163,25 @@ int copy(void* dst, const void* src, size_t n, bool to_gpu, void* stream) {
     if (cudaMemcpyAsync(dst, src, n, kind, s) != cudaSuccess) return -EIO;
     return cudaStreamSynchronize(s) == cudaSuccess ? 0 : -EIO;
 #else
-    (void)to_gpu; (void)stream;
-    memcpy(dst, src, n);
-    return 0;
+    (void)dst; (void)src; (void)n; (void)to_gpu; (void)stream;
+    return -ENOTSUP;
+#endif
+}
+
+// True if p is memory the CUDA runtime can copy to and from. Only a
+// CUDA+HIP build can be handed something else (a hipMalloc pointer); a
+// CUDA-only build skips the lookup.
+bool cuda_buffer(const void* p) {
+#if defined(UGDS_NVMEOF_CUDA) && defined(__HIP_PLATFORM_AMD__)
+    cudaPointerAttributes a{};
+    if (cudaPointerGetAttributes(&a, p) != cudaSuccess) {
+        cudaGetLastError();  // clear the sticky error for the next CUDA call
+        return false;
+    }
+    return a.type == cudaMemoryTypeDevice || a.type == cudaMemoryTypeManaged;
+#else
+    (void)p;
+    return true;
 #endif
 }
 
@@ -381,7 +402,9 @@ struct Lane {
     // initiator as one submission. The target moves the bytes.
     //
     // Once the direct controller has stopped, chunks it failed and every
-    // later chunk go through a host bounce and the kernel fd instead.
+    // later chunk go through a host bounce and the kernel fd instead. A
+    // failed chunk is redone only after every queue pair is in the error
+    // state, so the target cannot still be writing its GPU buffer.
     void run_direct() {
         std::vector<Req> batch;
         std::vector<ugds_capsule_op> ops;
@@ -395,10 +418,10 @@ struct Lane {
             for (size_t i = 0; i < batch.size(); ++i)
                 ops[i] = {batch[i].gpu, batch[i].len, batch[i].off, batch[i].is_write, -EIO};
             if (ugds_capsule_alive(direct)) ugds_capsule_submit(direct, ops.data(), (int)ops.size());
-            bool alive = ugds_capsule_alive(direct);
+            bool redo = !ugds_capsule_alive(direct) && ugds_capsule_wait_stopped(direct) == 0;
             for (size_t i = 0; i < batch.size(); ++i) {
                 int e = ops[i].result < 0 ? (int)ops[i].result : 0;
-                if (e && !alive) e = bounce_io(batch[i], fallback);
+                if (e && redo) e = bounce_io(batch[i], fallback);
                 chunk_done(batch[i].op, e);
             }
         }
@@ -638,21 +661,33 @@ int ugds_nvmeof_attach_direct(ugds_nvmeof_ep* ep, uint64_t capacity) {
 #endif
 }
 
+bool ugds_nvmeof_cuda_buffer(const void* buf) { return cuda_buffer(buf); }
+
 // on_lane == false: uGDSRead/Write. Copy and block I/O on this thread.
 // on_lane == true:  uGDSReadAsync/WriteAsync. The CUDA host callback must
 // not call cudaMemcpy, so the lane thread does both and we wait here.
 ssize_t ugds_nvmeof_io(ugds_nvmeof_ep* ep, void* buf, size_t size, off_t file_offset,
                        off_t buf_offset, bool is_write, bool on_lane) {
-    if (!ep->aligned(file_offset, size, buf_offset)) return -EINVAL;
+    // On a lane (inside a CUDA host callback) the buffer was checked at
+    // enqueue (async_validate), since the callback may not call CUDA.
+    if (!ep->aligned(file_offset, size, buf_offset) || (!on_lane && !cuda_buffer(buf)))
+        return -EINVAL;
     void* gpu = (char*)buf + buf_offset;
 #ifdef UGDS_HAVE_CAPSULE
     // Direct and not inside a CUDA host callback: the initiator only calls
     // CUDA to look up or register the buffer, which is allowed here. If the
     // direct controller has stopped, use the kernel path below; the kernel
-    // initiator reconnects on its own.
-    if (ep->direct && !on_lane && ugds_capsule_alive(ep->direct)) {
-        ssize_t r = ugds_capsule_io(ep->direct, gpu, size, file_offset, is_write);
-        if (r >= 0 || ugds_capsule_alive(ep->direct)) return r;
+    // initiator reconnects on its own. The kernel path is used only once
+    // every queue pair is in the error state, also when the controller was
+    // already stopping on entry: until then the target may still write a
+    // buffer whose earlier request failed and is now being retried.
+    if (ep->direct && !on_lane) {
+        ssize_t r = -EIO;
+        if (ugds_capsule_alive(ep->direct)) {
+            r = ugds_capsule_io(ep->direct, gpu, size, file_offset, is_write);
+            if (r >= 0 || ugds_capsule_alive(ep->direct)) return r;
+        }
+        if (ugds_capsule_wait_stopped(ep->direct)) return r;
     }
 #endif
     // Bounce path on the calling thread: copy GPU->host (write), one
@@ -741,7 +776,7 @@ uGDSError_t ugds_nvmeof_batch_submit(void* batch, unsigned nr, uGDSIOParams_t* i
     for (unsigned i = 0; i < nr; ++i) {
         const uGDSIOParams_t& p = iocb[i];
         if (!p.devPtr_base || !b->ep->aligned(p.file_offset, p.size, p.devPtr_offset) ||
-            (p.opcode != UGDS_READ && p.opcode != UGDS_WRITE))
+            !cuda_buffer(p.devPtr_base) || (p.opcode != UGDS_READ && p.opcode != UGDS_WRITE))
             return make_error(UGDS_INVALID_VALUE);
     }
     unsigned base;

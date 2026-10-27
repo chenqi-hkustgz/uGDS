@@ -45,10 +45,12 @@ static void async_io_callback(void* userData)
                          file_offset, bufPtr_offset, req->opcode);
     *req->bytes_done_p = ret;
 
-    /* Release the in-flight reference held by async_validate.
+    /* Release the in-flight reference async_validate took, if it took one.
      * do_io_internal manages its own reference for registered buffers,
-     * so this accounts for the enqueue-time increment only. */
-    {
+     * so this accounts for the enqueue-time increment only. A remote
+     * request may have been queued with an unregistered buffer; if the
+     * buffer was registered since, the entry found here is not ours. */
+    if (req->buf_ref) {
         std::lock_guard<std::mutex> drv_lock(g_driver.lock);
         auto it = g_driver.buf_registry.find(req->bufPtr_base);
         if (it != g_driver.buf_registry.end())
@@ -61,11 +63,16 @@ static void async_io_callback(void* userData)
     delete req;
 }
 
+/* On success, *buf_ref_out says whether an in_flight reference on
+ * bufPtr_base was taken; whoever finishes the request releases exactly
+ * that (async_io_callback, or async_release_inflight on enqueue failure). */
 static uGDSError_t async_validate(uGDSHandle_t fh, void* bufPtr_base,
                                    size_t* size_p, off_t* file_offset_p,
                                    off_t* bufPtr_offset_p, ssize_t* bytes_done_p,
-                                   std::shared_ptr<HandleState>* hs_sp_out)
+                                   std::shared_ptr<HandleState>* hs_sp_out,
+                                   bool* buf_ref_out)
 {
+    *buf_ref_out = false;
     if (!g_driver.initialized)
         return make_error(UGDS_DRIVER_NOT_INITIALIZED);
     if (fh == nullptr || bufPtr_base == nullptr)
@@ -85,8 +92,15 @@ static uGDSError_t async_validate(uGDSHandle_t fh, void* bufPtr_base,
      * anyway, hold the same in-flight reference the local path holds, so
      * BufDeregister still waits for this callback. */
     if (hs->is_remote) {
-        if (it != g_driver.buf_registry.end())
+        if (!ugds_nvmeof_cuda_buffer(bufPtr_base)) {
+            handle_release(hs);
+            if (hs_sp_out) hs_sp_out->reset();
+            return make_error(UGDS_INVALID_VALUE);
+        }
+        if (it != g_driver.buf_registry.end()) {
             it->second.in_flight.fetch_add(1, std::memory_order_acq_rel);
+            *buf_ref_out = true;
+        }
         return UGDS_OK;
     }
     if (it == g_driver.buf_registry.end()) {
@@ -99,18 +113,19 @@ static uGDSError_t async_validate(uGDSHandle_t fh, void* bufPtr_base,
      * This prevents uGDSBufDeregister from unmapping the buffer
      * while the async request is queued but not yet executed. */
     it->second.in_flight.fetch_add(1, std::memory_order_acq_rel);
+    *buf_ref_out = true;
     return UGDS_OK;
 }
 
 static AsyncRequest* make_async_request(uGDSHandle_t fh, void* bufPtr_base,
                                          size_t* size_p, off_t* file_offset_p,
                                          off_t* bufPtr_offset_p, ssize_t* bytes_done_p,
-                                         uint8_t opcode,
+                                         uint8_t opcode, bool buf_ref,
                                          std::shared_ptr<HandleState> hs_sp)
 {
     AsyncRequest* req = new (std::nothrow) AsyncRequest{
         fh, bufPtr_base, size_p, file_offset_p, bufPtr_offset_p,
-        bytes_done_p, opcode, std::move(hs_sp)
+        bytes_done_p, opcode, buf_ref, std::move(hs_sp)
     };
     return req;
 }
@@ -208,12 +223,13 @@ static uGDSError_t async_launch_host_func(ugsd_stream_t stream,
 }
 #endif
 
-static void async_release_inflight(void* bufPtr_base,
+/* Undo async_validate when the request never reaches its callback. */
+static void async_release_inflight(void* bufPtr_base, bool buf_ref,
                                     std::shared_ptr<HandleState>* hs_sp)
 {
     std::lock_guard<std::mutex> drv_lock(g_driver.lock);
     auto it = g_driver.buf_registry.find(bufPtr_base);
-    if (it != g_driver.buf_registry.end())
+    if (buf_ref && it != g_driver.buf_registry.end())
         it->second.in_flight.fetch_sub(1, std::memory_order_acq_rel);
 
     if (hs_sp && *hs_sp) {
@@ -230,8 +246,9 @@ extern "C" uGDSError_t uGDSReadAsync(uGDSHandle_t fh, void* bufPtr_base,
                                        void* stream)
 {
     std::shared_ptr<HandleState> hs_sp;
+    bool buf_ref = false;
     uGDSError_t st = async_validate(fh, bufPtr_base, size_p, file_offset_p,
-                                     bufPtr_offset_p, bytes_read_p, &hs_sp);
+                                     bufPtr_offset_p, bytes_read_p, &hs_sp, &buf_ref);
     if (st.err != UGDS_SUCCESS) return st;
 
 #if defined(_CUDA) && defined(__HIP_PLATFORM_AMD__)
@@ -240,7 +257,7 @@ extern "C" uGDSError_t uGDSReadAsync(uGDSHandle_t fh, void* bufPtr_base,
     {
         uGDSError_t sbe = async_check_stream_backend(stream, bufPtr_base);
         if (sbe.err != UGDS_SUCCESS) {
-            async_release_inflight(bufPtr_base, &hs_sp);
+            async_release_inflight(bufPtr_base, buf_ref, &hs_sp);
             return sbe;
         }
     }
@@ -249,10 +266,10 @@ extern "C" uGDSError_t uGDSReadAsync(uGDSHandle_t fh, void* bufPtr_base,
     /* Keep a copy of hs_sp so we can release on launch failure.
      * The request also holds a copy. */
     AsyncRequest* req = make_async_request(fh, bufPtr_base, size_p, file_offset_p,
-                                            bufPtr_offset_p, bytes_read_p, NVM_IO_READ,
+                                            bufPtr_offset_p, bytes_read_p, NVM_IO_READ, buf_ref,
                                             hs_sp);
     if (req == nullptr) {
-        async_release_inflight(bufPtr_base, &hs_sp);
+        async_release_inflight(bufPtr_base, buf_ref, &hs_sp);
         return make_error(UGDS_INTERNAL_ERROR);
     }
 #if defined(_CUDA) && defined(__HIP_PLATFORM_AMD__)
@@ -267,14 +284,14 @@ extern "C" uGDSError_t uGDSReadAsync(uGDSHandle_t fh, void* bufPtr_base,
     {
         uGDSError_t est = async_launch_host_func((ugsd_stream_t)stream, req, NVM_IO_READ, backend);
         if (est.err != UGDS_SUCCESS)
-            async_release_inflight(bufPtr_base, &hs_sp);
+            async_release_inflight(bufPtr_base, buf_ref, &hs_sp);
         return est;
     }
 #else
     {
         uGDSError_t est = async_launch_host_func((ugsd_stream_t)stream, req, NVM_IO_READ);
         if (est.err != UGDS_SUCCESS)
-            async_release_inflight(bufPtr_base, &hs_sp);
+            async_release_inflight(bufPtr_base, buf_ref, &hs_sp);
         return est;
     }
 #endif
@@ -286,8 +303,9 @@ extern "C" uGDSError_t uGDSWriteAsync(uGDSHandle_t fh, void* bufPtr_base,
                                         void* stream)
 {
     std::shared_ptr<HandleState> hs_sp;
+    bool buf_ref = false;
     uGDSError_t st = async_validate(fh, bufPtr_base, size_p, file_offset_p,
-                                     bufPtr_offset_p, bytes_written_p, &hs_sp);
+                                     bufPtr_offset_p, bytes_written_p, &hs_sp, &buf_ref);
     if (st.err != UGDS_SUCCESS) return st;
 
 #if defined(_CUDA) && defined(__HIP_PLATFORM_AMD__)
@@ -296,17 +314,17 @@ extern "C" uGDSError_t uGDSWriteAsync(uGDSHandle_t fh, void* bufPtr_base,
     {
         uGDSError_t sbe = async_check_stream_backend(stream, bufPtr_base);
         if (sbe.err != UGDS_SUCCESS) {
-            async_release_inflight(bufPtr_base, &hs_sp);
+            async_release_inflight(bufPtr_base, buf_ref, &hs_sp);
             return sbe;
         }
     }
 #endif
 
     AsyncRequest* req = make_async_request(fh, bufPtr_base, size_p, file_offset_p,
-                                            bufPtr_offset_p, bytes_written_p, NVM_IO_WRITE,
+                                            bufPtr_offset_p, bytes_written_p, NVM_IO_WRITE, buf_ref,
                                             hs_sp);
     if (req == nullptr) {
-        async_release_inflight(bufPtr_base, &hs_sp);
+        async_release_inflight(bufPtr_base, buf_ref, &hs_sp);
         return make_error(UGDS_INTERNAL_ERROR);
     }
 #if defined(_CUDA) && defined(__HIP_PLATFORM_AMD__)
@@ -321,14 +339,14 @@ extern "C" uGDSError_t uGDSWriteAsync(uGDSHandle_t fh, void* bufPtr_base,
     {
         uGDSError_t est = async_launch_host_func((ugsd_stream_t)stream, req, NVM_IO_WRITE, backend);
         if (est.err != UGDS_SUCCESS)
-            async_release_inflight(bufPtr_base, &hs_sp);
+            async_release_inflight(bufPtr_base, buf_ref, &hs_sp);
         return est;
     }
 #else
     {
         uGDSError_t est = async_launch_host_func((ugsd_stream_t)stream, req, NVM_IO_WRITE);
         if (est.err != UGDS_SUCCESS)
-            async_release_inflight(bufPtr_base, &hs_sp);
+            async_release_inflight(bufPtr_base, buf_ref, &hs_sp);
         return est;
     }
 #endif

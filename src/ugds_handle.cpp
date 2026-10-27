@@ -403,6 +403,13 @@ extern "C" uGDSError_t uGDSHandleRegisterNvmeofEx(uGDSHandle_t* fh, int fd,
         return make_error(UGDS_INVALID_VALUE);
     if (!g_driver.initialized)
         return make_error(UGDS_DRIVER_NOT_INITIALIZED);
+#ifndef _CUDA
+    /* Remote I/O copies through the CUDA runtime (host bounce) or registers
+     * CUDA allocations with the NIC (GPU-direct). A build without the CUDA
+     * backend has neither, so it offers no remote handles rather than
+     * handing a HIP device pointer to memcpy. */
+    return make_error(UGDS_IO_NOT_SUPPORTED);
+#endif
 
     size_t block_size = 0;
     uint64_t capacity = 0;

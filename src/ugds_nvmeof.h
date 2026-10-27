@@ -47,6 +47,11 @@ ssize_t ugds_nvmeof_io(ugds_nvmeof_ep* ep, void* buf, size_t size,
                        off_t file_offset, off_t buf_offset, bool is_write,
                        bool on_lane);
 
+// False if buf is memory the remote path cannot use (a HIP allocation in a
+// CUDA+HIP build). May call CUDA, so not from a CUDA host callback; the
+// async path checks at enqueue because ugds_nvmeof_io(on_lane=true) cannot.
+bool ugds_nvmeof_cuda_buffer(const void* buf);
+
 // True when batch's first uint32_t is the remote tag ('RBN1'). Local
 // BatchState's first field is a different tag ('LBN1'), so this is safe
 // to call on either handle before any other field is read.

@@ -255,7 +255,6 @@ set(FUNCTIONAL_TESTS
     test_cq_dw11
     test_interrupt_mode
     test_dmabuf_export
-    test_nvmeof_register
 )
 
 # RDMA/dmabuf tests -- only built/run when RDMA is enabled
@@ -332,6 +331,18 @@ if(UGDS_BACKEND_CUDA)
         )
         target_link_libraries(bench_nvmeof_remote ugds CUDA::cudart)
         set_target_properties(bench_nvmeof_remote PROPERTIES
+            CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
+            BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+        )
+
+        # Remote handles need the CUDA backend, so this test is CUDA-only
+        # and not part of FUNCTIONAL_TESTS (which the HIP loop also builds).
+        add_executable(test_nvmeof_register test/functional/test_nvmeof_register.cu)
+        target_include_directories(test_nvmeof_register PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+        )
+        target_link_libraries(test_nvmeof_register ugds CUDA::cudart)
+        set_target_properties(test_nvmeof_register PROPERTIES
             CUDA_ARCHITECTURES "${UGDS_CUDA_ARCHITECTURES}"
             BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
         )

@@ -249,6 +249,7 @@ struct AsyncRequest {
     off_t*          bufPtr_offset_p;
     ssize_t*        bytes_done_p;
     uint8_t         opcode;
+    bool            buf_ref;  /* holds an in_flight reference on bufPtr_base */
     std::shared_ptr<HandleState> hs_sp;  /* keeps handle alive until callback */
 };
 

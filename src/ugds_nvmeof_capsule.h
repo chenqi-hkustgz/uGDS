@@ -26,7 +26,7 @@ struct ugds_capsule_target {
     std::string hostnqn;
     uint8_t hostid[16] = {};
     uint32_t nsid = 1;
-    int nr_io_queues = 8;
+    int nr_io_queues = 8;  // a request; the target may allocate fewer
     int queue_depth = 16;  // clamped to the target's CAP.MQES + 1
 };
 
@@ -35,8 +35,9 @@ struct ugds_capsule_target {
 // Returns 0 or a negative errno.
 int ugds_capsule_target_from_fd(int fd, ugds_capsule_target* t);
 
-// Opens an admin queue and t.nr_io_queues I/O queues, enables the controller,
-// and starts a keep-alive thread. Returns 0 or a negative errno.
+// Opens an admin queue, enables the controller, asks for t.nr_io_queues I/O
+// queues (Set Features, Number of Queues) and opens as many as the target
+// allocated, then starts a keep-alive thread. Returns 0 or a negative errno.
 int ugds_capsule_connect(const ugds_capsule_target& t, ugds_capsule_ctrl** out);
 void ugds_capsule_disconnect(ugds_capsule_ctrl* c);
 
@@ -61,8 +62,9 @@ struct ugds_capsule_op {
 
 // Runs n ops on one I/O queue, keeping up to queue_depth commands in flight.
 // gpu must be CUDA device memory; off and size must be multiples of the
-// block size. Each op gets its own result. Returns 0 when the queue stayed
-// usable, or a negative errno when the controller failed.
+// block size. No command carries more than the controller's maximum data
+// transfer size (MDTS). Each op gets its own result. Returns 0 when the
+// queue stayed usable, or a negative errno when the controller failed.
 //
 // Before each op the CUDA buffer ID of gpu is checked against the cached
 // registration, so a freed and reallocated address is registered again
@@ -76,7 +78,13 @@ ssize_t ugds_capsule_io(ugds_capsule_ctrl* c, void* gpu, size_t size, off_t off,
 int ugds_capsule_queue_depth(const ugds_capsule_ctrl* c);
 int ugds_capsule_nr_queues(const ugds_capsule_ctrl* c);
 
-// False once a transport error or command timeout stopped the controller.
-// There is no reconnect; every queue is in the error state, so the target
-// can no longer touch GPU memory through it.
+// False as soon as a transport error or command timeout starts stopping the
+// controller; no new command is sent after that. There is no reconnect.
 bool ugds_capsule_alive(const ugds_capsule_ctrl* c);
+
+// Call only once ugds_capsule_alive() is false. Waits until every queue
+// pair has been moved to the error state, after which the target can no
+// longer touch GPU memory through this controller. Returns 0 then, or -EIO
+// if some queue pair could not be stopped: data of failed requests may
+// still be written, so they must not be redone through another path.
+int ugds_capsule_wait_stopped(ugds_capsule_ctrl* c);

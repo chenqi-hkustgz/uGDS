@@ -17,14 +17,17 @@
 //   1. Admin queue: RDMA CM connect, then Fabrics Connect (qid 0,
 //      cntlid 0xffff). The CQE returns the target's cntlid.
 //   2. Property Get CAP (MQES caps the I/O queue depth, TO bounds the
-//      ready wait), Property Set CC.EN, poll CSTS.RDY.
-//   3. Identify Namespace: capacity and LBA size.
-//   4. Each I/O queue: RDMA CM connect, then Fabrics Connect with the
-//      cntlid from step 1. A queue that fails is rebuilt (see
+//      ready wait, MPSMIN scales MDTS), Property Set CC.EN, poll CSTS.RDY.
+//   3. Identify Controller (MDTS caps the command size) and Identify
+//      Namespace (capacity and LBA size).
+//   4. Set Features, Number of Queues: the target says how many I/O queues
+//      it allocated, possibly fewer than asked for.
+//   5. Each allocated I/O queue: RDMA CM connect, then Fabrics Connect with
+//      the cntlid from step 1. A queue that fails is rebuilt (see
 //      kConnectAttempts); the others are kept.
-//   5. Keep-alive thread: Keep Alive on the admin queue every KATO / 2.
+//   6. Keep-alive thread: Keep Alive on the admin queue every KATO / 2.
 //   ...I/O...
-//   6. Disconnect: stop keep-alive, Property Set CC.SHN, tear down QPs and
+//   7. Disconnect: stop keep-alive, Property Set CC.SHN, tear down QPs and
 //      memory regions, then the PD, then the CM ids.
 //
 // Threads and locks:
@@ -33,14 +36,17 @@
 //   - The admin queue is shared by setup, keep-alive and disconnect; its
 //     lock serializes them.
 //   - mr_m guards the GPU registration cache.
-//   - `dead` is the only cross-queue state on the I/O path.
+//   - `state` is the only cross-queue state on the I/O path.
 //
 // Failure model: any transport error or command timeout stops the
-// controller for good (mark_dead): every QP is moved to the error state at
-// once so the target cannot write into GPU memory any more, and later I/O
-// returns -EIO immediately. There is no reconnect here; the uGDS layer
-// (ugds_nvmeof.cpp) switches the handle back to the kernel path, which
-// reconnects on its own.
+// controller for good (mark_dead). The state goes Live -> Stopping, so later
+// I/O returns -EIO without sending anything; one thread moves every QP to
+// the error state so the target cannot write into GPU memory any more; then
+// the state goes to Stopped. A failing submission returns only after
+// Stopped, and the uGDS layer (ugds_nvmeof.cpp) waits for it too
+// (ugds_capsule_wait_stopped) before it redoes a request on the kernel
+// path. There is no reconnect here; the kernel initiator reconnects on its
+// own.
 #include "ugds_nvmeof_capsule.h"
 
 #include <cuda.h>
@@ -74,11 +80,15 @@ namespace {
 constexpr uint8_t kOpWrite = 0x01;
 constexpr uint8_t kOpRead = 0x02;
 constexpr uint8_t kOpIdentify = 0x06;
+constexpr uint8_t kOpSetFeatures = 0x09;
 constexpr uint8_t kOpKeepAlive = 0x18;
 constexpr uint8_t kOpFabrics = 0x7f;
 constexpr uint8_t kFctPropSet = 0x00;
 constexpr uint8_t kFctConnect = 0x01;
 constexpr uint8_t kFctPropGet = 0x04;
+constexpr uint8_t kCnsNamespace = 0x00;
+constexpr uint8_t kCnsController = 0x01;
+constexpr uint8_t kFeatNumQueues = 0x07;
 
 // SQE byte 1, PSDT = 01b: the data pointer is an SGL. Fabrics requires it.
 constexpr uint8_t kFlagSgl = 0x40;
@@ -118,6 +128,11 @@ constexpr int kAdminTimeoutMs = 10000;
 constexpr int kConnectTimeoutMs = 3000;
 constexpr int kConnectAttempts = 4;
 constexpr int kIoTimeoutMs = 30000;  // same as nvme_core io_timeout
+
+// Controller state, see the failure model at the top of this file.
+constexpr int kLive = 0;
+constexpr int kStopping = 1;
+constexpr int kStopped = 2;
 
 // 64-byte submission queue entry as raw bytes. Fields are written with
 // put16/32/64 at their spec offsets (little-endian host assumed, as on the
@@ -267,15 +282,18 @@ int parse_uuid(const std::string& s, uint8_t out[16]) {
 
 }  // namespace
 
-// Everything below except `dead`, `rr`, `active`, the MR cache and the
-// keep-alive fields is written only during connect, before the controller
-// is returned, and read-only afterwards.
+// Everything below except the stop fields, `rr`, `active`, the MR cache and
+// the keep-alive fields is written only during connect, before the
+// controller is returned, and read-only afterwards.
 //   ctx, pd     taken from the admin queue's CM id; every queue and MR uses
 //               this one PD so a GPU registration works on any queue
 //   rd_atom     max_qp_rd_atom, offered as responder_resources: the target
 //               RDMA-reads from us for writes
 //   admin_buf   host buffer for Connect data and Identify; also referenced
 //               by I/O-queue Connects during setup
+//   max_xfer    largest data length of one command (MDTS), 0 = no limit
+//   state       kLive / kStopping / kStopped; stop_ok is written under
+//               stop_m before state becomes kStopped
 struct ugds_capsule_ctrl {
     ugds_capsule_target t;
     ibv_context* ctx = nullptr;
@@ -288,7 +306,11 @@ struct ugds_capsule_ctrl {
     int io_depth = 0;
     uint64_t capacity = 0;
     uint32_t lba_shift = 0;
-    std::atomic<bool> dead{false};
+    size_t max_xfer = 0;
+    std::atomic<int> state{kLive};
+    bool stop_ok = true;  // every QP reached the error state
+    std::mutex stop_m;
+    std::condition_variable stop_cv;
     std::atomic<uint32_t> rr{0};
     std::atomic<int> active{0};  // submissions currently holding a queue
 
@@ -303,22 +325,57 @@ struct ugds_capsule_ctrl {
 
 namespace {
 
-// Stop the controller for good. Every QP goes to the error state at once, so
-// the target can no longer RDMA into GPU buffers whose I/O already returned
-// an error to the caller.
-void mark_dead(ugds_capsule_ctrl* c, const char* why) {
-    if (c->dead.exchange(true)) return;
-    fprintf(stderr, "uGDS capsule: controller stopped (%s)\n", why);
-    ibv_qp_attr a{};
-    a.qp_state = IBV_QPS_ERR;
-    for (auto& q : c->qs)
-        if (q->id && q->id->qp) ibv_modify_qp(q->id->qp, &a, IBV_QP_STATE);
+bool is_live(const ugds_capsule_ctrl* c) {
+    return c->state.load(std::memory_order_acquire) == kLive;
+}
+
+// Block until mark_dead() has finished; true if every QP was stopped.
+bool wait_stopped(ugds_capsule_ctrl* c) {
+    std::unique_lock<std::mutex> g(c->stop_m);
+    c->stop_cv.wait(g, [&] { return c->state.load(std::memory_order_acquire) == kStopped; });
+    return c->stop_ok;
+}
+
+// Stop the controller for good and return only once every QP is in the
+// error state, so the target can no longer RDMA into GPU buffers whose I/O
+// is about to return an error (or be redone on the kernel path).
+//
+// The first caller moves Live -> Stopping and does the work; Stopping alone
+// already keeps new commands off the wire. Concurrent callers wait for
+// Stopped instead of returning at once: their own commands may sit on a QP
+// the first caller has not reached yet.
+//
+// Returns false if some QP could not be moved to the error state. Nothing
+// then promises that RDMA access to GPU memory has ceased.
+bool mark_dead(ugds_capsule_ctrl* c, const char* why) {
+    int live = kLive;
+    if (!c->state.compare_exchange_strong(live, kStopping, std::memory_order_acq_rel))
+        return wait_stopped(c);
+    fprintf(stderr, "uGDS capsule: stopping controller (%s)\n", why);
+    bool ok = true;
+    for (auto& q : c->qs) {
+        if (!q->id || !q->id->qp) continue;
+        ibv_qp_attr a{};
+        a.qp_state = IBV_QPS_ERR;
+        // Returns an errno value, not -1.
+        if (int r = ibv_modify_qp(q->id->qp, &a, IBV_QP_STATE)) {
+            fprintf(stderr, "uGDS capsule: qid %d not stopped (%s)\n", q->qid, strerror(r));
+            ok = false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> g(c->stop_m);
+        c->stop_ok = ok;
+        c->state.store(kStopped, std::memory_order_release);
+    }
+    c->stop_cv.notify_all();
+    return ok;
 }
 
 // Post n (<= q->depth) commands on q and wait for all n CQEs; out[i] gets
-// the CQE of cmds[i]. Caller holds q->m. A failure marks the whole
-// controller dead unless fatal is false (queue bring-up, where only this
-// queue is retried).
+// the CQE of cmds[i]. Caller holds q->m. A failure stops the whole
+// controller, and returns only after it has stopped, unless fatal is false
+// (queue bring-up, where only this queue is retried).
 //
 // CID = epoch << 6 | slot. The epoch advances on every submission, so a CQE
 // that arrives late for an earlier, abandoned submission does not match and
@@ -328,7 +385,7 @@ void mark_dead(ugds_capsule_ctrl* c, const char* why) {
 // acknowledged every SQE and the SQE slots can be reused.
 int submit(ugds_capsule_ctrl* c, Queue* q, Sqe* cmds, int n, Cqe* out, int timeout_ms,
            bool fatal = true) {
-    if (c->dead.load(std::memory_order_acquire)) return -EIO;
+    if (!is_live(c)) return -EIO;
     uint16_t epoch = q->epoch++ & 0x3ff;
     ibv_sge sge[kMaxDepth];
     ibv_send_wr wr[kMaxDepth];
@@ -608,6 +665,24 @@ void queue_close(Queue* q) {
     q->sqe = q->rsp = nullptr;
 }
 
+// Identify Controller (CNS 1) into admin_buf, for MDTS (byte 77): the
+// largest data transfer of one command is 2^MDTS units of the minimum
+// memory page size, 2^(12 + CAP.MPSMIN) bytes (CAP bits 51:48). MDTS 0
+// means the controller sets no limit; the Linux host reads it the same way.
+int identify_ctrl(ugds_capsule_ctrl* c, uint64_t cap) {
+    Sqe s = make_cmd(kOpIdentify);
+    set_sgl(s, (uint64_t)c->admin_buf, 4096, c->admin_mr->rkey);
+    put32(s, 40, kCnsController);
+    memset(c->admin_buf, 0, 4096);
+    Cqe e;
+    if (int r = admin_cmd(c, s, &e)) return r;
+    unsigned mdts = c->admin_buf[77];
+    unsigned shift = mdts + 12 + (unsigned)((cap >> 48) & 0xf);
+    // A limit of 2^40 bytes or more is no limit for us.
+    c->max_xfer = mdts && shift < 40 ? (size_t)1 << shift : 0;
+    return 0;
+}
+
 // Identify Namespace (CNS 0) into admin_buf. Uses NSZE (bytes 0..7) times
 // the data size of the active LBA format (FLBAS bits 3:0 at byte 26 index
 // the LBA format table at byte 128, 4 bytes per entry, LBADS in byte 2),
@@ -616,7 +691,7 @@ int identify_ns(ugds_capsule_ctrl* c) {
     Sqe s = make_cmd(kOpIdentify);
     put32(s, 4, c->t.nsid);
     set_sgl(s, (uint64_t)c->admin_buf, 4096, c->admin_mr->rkey);
-    put32(s, 40, 0);  // CNS 0: namespace data structure
+    put32(s, 40, kCnsNamespace);
     memset(c->admin_buf, 0, 4096);
     Cqe e;
     if (int r = admin_cmd(c, s, &e)) return r;
@@ -627,6 +702,25 @@ int identify_ns(ugds_capsule_ctrl* c) {
     if (nsze == 0 || lbads < 9 || lbads > 16) return -EPROTO;
     c->lba_shift = lbads;
     c->capacity = nsze << lbads;
+    return 0;
+}
+
+// Set Features, Number of Queues (FID 07h): ask for `want` I/O submission
+// and completion queues (CDW11: NCQR 31:16, NSQR 15:0, both 0-based). The
+// CQE's dw0 holds what the target allocated (NCQA, NSQA, same layout),
+// which may be fewer; each I/O queue needs one of each. Same exchange as
+// nvme_set_queue_count() in the Linux host.
+int set_queue_count(ugds_capsule_ctrl* c, int want, int* got) {
+    Sqe s = make_cmd(kOpSetFeatures);
+    set_sgl(s, 0, 0, 0);
+    put32(s, 40, kFeatNumQueues);
+    uint32_t n = (uint32_t)(want - 1);
+    put32(s, 44, n << 16 | n);
+    Cqe e;
+    if (int r = admin_cmd(c, s, &e)) return r;
+    int nsqa = (int)(e.dw0 & 0xffff) + 1;
+    int ncqa = (int)(e.dw0 >> 16) + 1;
+    *got = std::min({want, nsqa, ncqa});
     return 0;
 }
 
@@ -696,6 +790,22 @@ Queue* take_queue(ugds_capsule_ctrl* c) {
     Queue* q = c->qs[1 + start % nio].get();
     q->m.lock();
     return q;
+}
+
+// Command size for `total` bytes spread over about `budget` commands: the
+// smallest power of two from kMinPiece up that covers total in budget
+// commands, at most kMaxPiece and the controller's MDTS, at least a block.
+// One 128 KiB read alone -> budget 16 -> 16 KiB pieces x 8.
+// 32 concurrent 128 KiB reads -> budget 2 -> 64 KiB pieces x 2.
+// A target with MDTS = 128 KiB gets 128 KiB pieces where 1 MiB would
+// otherwise be chosen. max_xfer and kMinPiece are powers of two and
+// max_xfer >= one block (checked at connect), so the result stays a
+// multiple of the block size.
+size_t piece_size(const ugds_capsule_ctrl* c, size_t total, size_t budget) {
+    size_t max_piece = c->max_xfer ? std::min(kMaxPiece, c->max_xfer) : kMaxPiece;
+    size_t piece = std::min(kMinPiece, max_piece);
+    while (piece < max_piece && piece * budget < total) piece <<= 1;
+    return std::max<size_t>(piece, (size_t)1 << c->lba_shift);
 }
 
 }  // namespace
@@ -775,12 +885,25 @@ int ugds_capsule_connect(const ugds_capsule_target& t, ugds_capsule_ctrl** out) 
         if (waited > std::max(ready_ms, 1000)) return fail(-ETIMEDOUT);
         usleep(10000);
     }
+    if (int r = identify_ctrl(c, cap)) return fail(r);
     if (int r = identify_ns(c)) return fail(r);
+    if (c->max_xfer && c->max_xfer < (size_t)1 << c->lba_shift) {
+        fprintf(stderr, "uGDS capsule: MDTS %zu bytes is below one block\n", c->max_xfer);
+        return fail(-EPROTO);
+    }
 
-    // Step 4. Queues are opened one after another; each failed attempt is
+    // Step 4. Fewer queues than asked for is fine: lanes follow
+    // ugds_capsule_nr_queues().
+    int nr_io = 0;
+    if (int r = set_queue_count(c, std::min(t.nr_io_queues, 0xffff), &nr_io)) return fail(r);
+    if (nr_io < t.nr_io_queues)
+        fprintf(stderr, "uGDS capsule: target allocated %d of %d I/O queues\n", nr_io,
+                t.nr_io_queues);
+
+    // Step 5. Queues are opened one after another; each failed attempt is
     // torn down completely and rebuilt on a fresh CM id.
     c->io_depth = std::min({t.queue_depth, mqes, kMaxDepth});
-    for (int i = 1; i <= t.nr_io_queues; ++i) {
+    for (int i = 1; i <= nr_io; ++i) {
         int r = -ETIMEDOUT;
         for (int attempt = 0; attempt < kConnectAttempts && r; ++attempt) {
             auto q = std::make_unique<Queue>();
@@ -805,7 +928,7 @@ int ugds_capsule_connect(const ugds_capsule_target& t, ugds_capsule_ctrl** out) 
     return 0;
 }
 
-// Step 6. Callers guarantee no submission is running (uGDS joins its lanes
+// Step 7. Callers guarantee no submission is running (uGDS joins its lanes
 // and drains the handle first). Also used on half-built controllers.
 void ugds_capsule_disconnect(ugds_capsule_ctrl* c) {
     if (!c) return;
@@ -819,7 +942,7 @@ void ugds_capsule_disconnect(ugds_capsule_ctrl* c) {
     }
     // Orderly shutdown so the target frees this controller now instead of
     // waiting for KATO to expire.
-    if (c->cntlid && !c->dead.load())
+    if (c->cntlid && is_live(c))
         prop_set(c, kRegCc, (uint32_t)(kCcEnable | kCcIoSqes | kCcIoCqes | kCcShutdownNormal));
     for (auto it = c->qs.rbegin(); it != c->qs.rend(); ++it) queue_close(it->get());
     for (auto& m : c->mrs) ibv_dereg_mr(m.mr);
@@ -901,7 +1024,8 @@ void ugds_capsule_unregister(ugds_capsule_ctrl* c, const void* gpu) {
 // 1. Validate every op and look up (or create) its GPU registration;
 //    a bad op gets its own error and the rest still run.
 // 2. Take one I/O queue for the whole call.
-// 3. Choose the piece size from the total bytes and the command budget.
+// 3. Choose the piece size from the total bytes and the command budget,
+//    never above the controller's MDTS.
 // 4. Issue pieces in rounds of up to queue_depth commands; owner[] maps
 //    each command back to its op. A failed piece fails its op; a
 //    transport failure fails every op not yet finished.
@@ -919,7 +1043,7 @@ int ugds_capsule_submit(ugds_capsule_ctrl* c, ugds_capsule_op* ops, int n) {
         else if (int r = get_mr(c, o.gpu, o.size, &mr[i]))
             o.result = r;
     }
-    if (c->dead.load(std::memory_order_acquire)) {
+    if (!is_live(c)) {
         for (int i = 0; i < n; ++i)
             if (!ops[i].result) ops[i].result = -EIO;
         return -EIO;
@@ -933,15 +1057,11 @@ int ugds_capsule_submit(ugds_capsule_ctrl* c, ugds_capsule_op* ops, int n) {
         ~Leave() { a.fetch_sub(1, std::memory_order_relaxed); }
     } leave{c->active};
 
-    // Example: one 128 KiB read alone -> budget 16 -> 16 KiB pieces x 8.
-    // 32 concurrent 128 KiB reads -> budget 2 -> 64 KiB pieces x 2.
     size_t total = 0;
     for (int j = 0; j < n; ++j)
         if (!ops[j].result) total += ops[j].size;
     size_t budget = (size_t)std::clamp(kInflightBudget / active, 1, q->depth);
-    size_t piece = kMinPiece;
-    while (piece < kMaxPiece && piece * budget < total) piece <<= 1;
-    piece = std::max<size_t>(piece, blk);
+    size_t piece = piece_size(c, total, budget);
 
     Sqe cmds[kMaxDepth];
     Cqe cqes[kMaxDepth];
@@ -995,9 +1115,9 @@ ssize_t ugds_capsule_io(ugds_capsule_ctrl* c, void* gpu, size_t size, off_t off,
     return o.result;
 }
 
-bool ugds_capsule_alive(const ugds_capsule_ctrl* c) {
-    return !c->dead.load(std::memory_order_acquire);
-}
+bool ugds_capsule_alive(const ugds_capsule_ctrl* c) { return is_live(c); }
+
+int ugds_capsule_wait_stopped(ugds_capsule_ctrl* c) { return wait_stopped(c) ? 0 : -EIO; }
 
 int ugds_capsule_queue_depth(const ugds_capsule_ctrl* c) { return c->io_depth; }
 

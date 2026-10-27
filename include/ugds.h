@@ -138,6 +138,16 @@ uGDSError_t uGDSHandleRegister(uGDSHandle_t* fh, uGDSDescr_t* descr);
  * so more than one hardware queue is kept busy. uGDSBufRegister is not
  * required. Offsets and lengths must be multiples of the logical block
  * size. The caller keeps ownership of fd and closes it after deregister.
+ *
+ * Remote handles need the CUDA backend and CUDA buffers. A build without
+ * it returns UGDS_IO_NOT_SUPPORTED; in a CUDA+HIP build, I/O on a HIP
+ * buffer fails with an invalid-value error.
+ *
+ * With UGDS_NVMEOF_GPU_DIRECT, a request that fails because the direct
+ * controller stopped is redone on the kernel path once the controller can
+ * no longer access GPU memory. A write the target had already taken in
+ * before the stop may still reach the media after that redo; a later write
+ * to the same blocks should not race with such a failure.
  */
 
 uGDSError_t uGDSHandleRegisterNvmeof(uGDSHandle_t* fh, int fd);
@@ -151,11 +161,14 @@ enum {
      * build with UGDS_ENABLE_NVMEOF_CAPSULE and a GPU driver that exports
      * dma-buf. Buffers passed to I/O must be CUDA device memory.
      *
-     * As with local P2P handles, the NIC reads the buffer outside any CUDA
-     * stream: work that fills a buffer must have finished before uGDSWrite
-     * (synchronize the producing stream; a cudaMemcpy from pageable host
-     * memory can return before its data reaches the GPU).
-     * uGDSWriteAsync is ordered on its stream and needs no extra sync. */
+     * As with local P2P handles, the NIC accesses the buffer outside any
+     * CUDA stream. Work that fills a buffer must have finished before
+     * uGDSWrite (synchronize the producing stream; a cudaMemcpy from
+     * pageable host memory can return before its data reaches the GPU).
+     * Likewise, no pending CUDA work may still write a buffer passed to
+     * uGDSRead or batch reads: an unsynchronized cudaMemset can land on
+     * top of the data the target just wrote. uGDSReadAsync and
+     * uGDSWriteAsync are ordered on their stream and need no extra sync. */
     UGDS_NVMEOF_GPU_DIRECT = 1u << 0,
 };
 

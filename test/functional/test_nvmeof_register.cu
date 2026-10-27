@@ -6,14 +6,24 @@
 // - Writes need NVMEOF_TEST_ALLOW_WRITE=1 AND an unmounted device; they go to
 //   16 GiB, and mounted devices are refused.
 // Exit 77 = SKIP (matches scripts/run_tests.sh convention).
+// CUDA-only: remote handles need the CUDA backend (see CMakeLists.txt).
 #include <cuda_runtime.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+#include <atomic>
+
 #include "ugds.h"
+
+// Host function that holds its stream until *gate becomes non-zero.
+static void CUDART_CB wait_gate(void *gate) {
+  while (!static_cast<std::atomic<int> *>(gate)->load()) sched_yield();
+}
 
 #define CHECK_CUDA(x)                                                    \
   do {                                                                   \
@@ -130,7 +140,10 @@ int main(int argc, char **argv) {
     printf("PASS: uGDSWrite 4K OK\n");
   }
   // Read path (always safe): compare uGDSRead against kernel pread.
+  // GPU-direct: the target RDMA-writes outside CUDA stream order, so the
+  // clearing memset must finish first or it can land on top of the data.
   CHECK_CUDA(cudaMemset(gpu, 0, kSize));
+  CHECK_CUDA(cudaDeviceSynchronize());
   if (uGDSRead(fh, gpu, kSize, kOff, 0) != (ssize_t)kSize) {
     printf("FAIL: uGDSRead\n");
     return 1;
@@ -158,6 +171,7 @@ int main(int argc, char **argv) {
     void *gpu_big = nullptr;
     CHECK_CUDA(cudaMalloc(&gpu_big, big));
     CHECK_CUDA(cudaMemset(gpu_big, 0, big));
+    CHECK_CUDA(cudaDeviceSynchronize());  // see the 4K read above
     if (uGDSRead(fh, gpu_big, big, 1 << 20, 0) != (ssize_t)big) {
       printf("FAIL: uGDSRead 1M\n");
       return 1;
@@ -190,6 +204,7 @@ int main(int argc, char **argv) {
     void *gpu_b = nullptr;
     CHECK_CUDA(cudaMalloc(&gpu_b, nio * one));
     CHECK_CUDA(cudaMemset(gpu_b, 0, nio * one));
+    CHECK_CUDA(cudaDeviceSynchronize());  // see the 4K read above
     uGDSIOParams_t ps[16];
     memset(ps, 0, sizeof(ps));
     for (unsigned i = 0; i < nio; ++i) {
@@ -221,6 +236,12 @@ int main(int argc, char **argv) {
     }
     char *got = (char *)malloc(nio * one);
     CHECK_CUDA(cudaMemcpy(got, gpu_b, nio * one, cudaMemcpyDeviceToHost));
+    // fd is O_DIRECT: the reference buffer must be block aligned.
+    char *kern = nullptr;
+    if (posix_memalign((void **)&kern, 4096, one)) {
+      printf("FAIL: batch reference alloc\n");
+      return 1;
+    }
     for (unsigned i = 0; i < nr; ++i) {
       unsigned idx = (unsigned)(uintptr_t)ev[i].cookie;
       if (ev[i].status != UGDS_BATCH_COMPLETE || ev[i].ret != (ssize_t)one ||
@@ -229,14 +250,19 @@ int main(int argc, char **argv) {
                (long)ev[i].ret);
         return 1;
       }
-      char kern[4096];
-      if (pread(fd, kern, one, (off_t)(idx * one)) != (ssize_t)one ||
-          memcmp(kern, got + idx * one, one) != 0) {
+      ssize_t n = pread(fd, kern, one, (off_t)(idx * one));
+      if (n != (ssize_t)one) {
+        printf("FAIL: batch reference pread at %u returned %ld (%s)\n", idx, (long)n,
+               n < 0 ? strerror(errno) : "short read");
+        return 1;
+      }
+      if (memcmp(kern, got + idx * one, one) != 0) {
         printf("FAIL: batch read mismatch at %u\n", idx);
         return 1;
       }
     }
     printf("PASS: remote batch 16x4K matches kernel pread\n");
+    free(kern);
     free(got);
     uGDSBatchIODestroy(batch);
     cudaFree(gpu_b);
@@ -264,6 +290,49 @@ int main(int argc, char **argv) {
     }
     cudaStreamDestroy(st);
     printf("PASS: remote uGDSReadAsync matches kernel pread\n");
+  }
+
+  // A remote async request queued with an unregistered buffer holds no
+  // buffer reference. If the buffer is registered before the callback runs,
+  // the callback must not drop a reference it never took, or the buffer
+  // can never be deregistered (UGDS_BUSY). A host function holds the stream
+  // until the registration is done. uGDSBufRegister needs a local
+  // controller; without one this check is skipped.
+  {
+    const size_t len = 2 << 20;
+    void *gpu_a = nullptr;
+    CHECK_CUDA(cudaMalloc(&gpu_a, len));
+    cudaStream_t st;
+    // Non-blocking, so a legacy-stream call inside uGDSBufRegister cannot
+    // wait on the gated stream and hang the test.
+    CHECK_CUDA(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+    std::atomic<int> gate{0};
+    CHECK_CUDA(cudaLaunchHostFunc(st, wait_gate, &gate));
+    size_t sz = kSize;
+    off_t foff = kOff, boff = 0;
+    ssize_t got = 0;
+    e = uGDSReadAsync(fh, gpu_a, &sz, &foff, &boff, &got, st);
+    uGDSError_t re = uGDSBufRegister(gpu_a, len, 0);
+    gate.store(1);
+    CHECK_CUDA(cudaStreamSynchronize(st));
+    cudaStreamDestroy(st);
+    if (e.err != UGDS_SUCCESS || got != (ssize_t)kSize) {
+      printf("FAIL: gated remote uGDSReadAsync err=%d ret=%ld\n", (int)e.err, (long)got);
+      return 1;
+    }
+    if (re.err != UGDS_SUCCESS) {
+      printf("SKIP: register during async (uGDSBufRegister err=%d, no local controller?)\n",
+             (int)re.err);
+    } else {
+      uGDSError_t de = uGDSBufDeregister(gpu_a);
+      if (de.err != UGDS_SUCCESS) {
+        printf("FAIL: deregister after async returned %d (reference count broken)\n",
+               (int)de.err);
+        return 1;
+      }
+      printf("PASS: register during remote async keeps the reference count\n");
+    }
+    cudaFree(gpu_a);
   }
 
   uGDSHandleDeregister(fh);  // fd ownership stays with caller
